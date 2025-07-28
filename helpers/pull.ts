@@ -23,8 +23,11 @@ export const pull = async (
 	const { vault } = t.app;
 	const adapter = vault.adapter;
 
+	console.log("[GDriveSync] Starting pull operation");
+	
 	if (!t.accessToken.token) await refreshAccessToken(t);
 
+	console.log("[GDriveSync] Searching for recently modified files...");
 	const recentlyModified = await t.drive.searchFiles({
 		include: ["id", "modifiedTime", "properties", "mimeType"],
 		matches: [
@@ -36,8 +39,23 @@ export const pull = async (
 		],
 	});
 	if (!recentlyModified) {
-		return new Notice("An error occurred fetching Google Drive files.");
+		console.error("[GDriveSync] Failed to fetch recently modified files");
+		return new Notice("An error occurred fetching Google Drive files. Check console for details.");
 	}
+
+	console.log(`[GDriveSync] Found ${recentlyModified.length} recently modified files`);
+
+	// Also fetch hidden files that might not be captured by regular search
+	console.log("[GDriveSync] Searching for hidden files...");
+	const hiddenFiles = await t.drive.searchHiddenFiles();
+	const recentHiddenFiles = hiddenFiles.filter(file => 
+		new Date(file.modifiedTime) > new Date(t.settings.lastSyncedAt)
+	);
+	
+	console.log(`[GDriveSync] Found ${hiddenFiles.length} total hidden files, ${recentHiddenFiles.length} recently modified`);
+	
+	const allRecentFiles = [...recentlyModified, ...recentHiddenFiles];
+	console.log(`[GDriveSync] Total files to process: ${allRecentFiles.length}`);
 
 	const changes = await t.drive.getChanges(t.settings.changesToken);
 	if (!changes) {
@@ -60,7 +78,7 @@ export const pull = async (
 			return file;
 		});
 
-	if (!recentlyModified.length && !deletions.length) {
+	if (!allRecentFiles.length && !deletions.length) {
 		if (silenceNotices) return;
 		t.endSync(syncNotice);
 		return new Notice("You're up to date!");
@@ -71,8 +89,10 @@ export const pull = async (
 	);
 
 	const updateMap = () => {
-		recentlyModified.forEach(({ id, properties }) => {
-			pathToId[properties.path] = id;
+		allRecentFiles.forEach(({ id, properties }) => {
+			if (properties?.path) {
+				pathToId[properties.path] = id;
+			}
 		});
 
 		t.settings.driveIdToPath = Object.fromEntries(
@@ -122,13 +142,13 @@ export const pull = async (
 	syncNotice?.setMessage("Syncing (33%)");
 
 	const upsertFiles = async () => {
-		const newFolders = recentlyModified.filter(
+		const newFolders = allRecentFiles.filter(
 			({ mimeType }) => mimeType === folderMimeType
 		);
 
 		if (newFolders.length) {
 			const batches = foldersToBatches(
-				newFolders.map(({ properties }) => properties.path)
+				newFolders.map(({ properties }) => properties?.path).filter(Boolean)
 			);
 
 			for (const batch of batches) {
@@ -149,12 +169,15 @@ export const pull = async (
 
 		let completed = 0;
 
-		const newNotes = recentlyModified.filter(
+		const newNotes = allRecentFiles.filter(
 			({ mimeType }) => mimeType !== folderMimeType
 		);
 
 		await batchAsyncs(
 			newNotes.map((file: FileMetadata) => async () => {
+				// Skip files without path property (shouldn't happen with hidden files, but safety check)
+				if (!file.properties?.path) return;
+				
 				const localFile =
 					vault.getFileByPath(file.properties.path) ||
 					(await adapter.exists(file.properties.path));

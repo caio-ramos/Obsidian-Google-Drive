@@ -120,34 +120,59 @@ export default class ObsidianGoogleDrive extends Plugin {
 	debouncedSaveSettings = debounce(this.saveSettings.bind(this), 500, true);
 
 	handleCreate(file: TAbstractFile) {
-		if (this.settings.operations[file.path] === "delete") {
-			if (file instanceof TFile) {
-				this.settings.operations[file.path] = "modify";
+		// Include hidden files and folders (starting with .)
+		if (this.shouldSyncFile(file.path)) {
+			if (this.settings.operations[file.path] === "delete") {
+				if (file instanceof TFile) {
+					this.settings.operations[file.path] = "modify";
+				} else {
+					delete this.settings.operations[file.path];
+				}
 			} else {
-				delete this.settings.operations[file.path];
+				this.settings.operations[file.path] = "create";
 			}
-		} else {
-			this.settings.operations[file.path] = "create";
+			this.debouncedSaveSettings();
 		}
-		this.debouncedSaveSettings();
 	}
 
 	handleDelete(file: TAbstractFile) {
-		if (this.settings.operations[file.path] === "create") {
-			delete this.settings.operations[file.path];
-		} else {
-			this.settings.operations[file.path] = "delete";
+		// Include hidden files and folders (starting with .)
+		if (this.shouldSyncFile(file.path)) {
+			if (this.settings.operations[file.path] === "create") {
+				delete this.settings.operations[file.path];
+			} else {
+				this.settings.operations[file.path] = "delete";
+			}
+			this.debouncedSaveSettings();
 		}
-		this.debouncedSaveSettings();
 	}
 
 	handleModify(file: TFile) {
-		const operation = this.settings.operations[file.path];
-		if (operation === "create" || operation === "modify") {
-			return;
+		// Include hidden files and folders (starting with .)
+		if (this.shouldSyncFile(file.path)) {
+			const operation = this.settings.operations[file.path];
+			if (operation === "create" || operation === "modify") {
+				return;
+			}
+			this.settings.operations[file.path] = "modify";
+			this.debouncedSaveSettings();
 		}
-		this.settings.operations[file.path] = "modify";
-		this.debouncedSaveSettings();
+	}
+
+	shouldSyncFile(path: string): boolean {
+		// Allow syncing of hidden files/folders (starting with .)
+		// Exclude only system files that shouldn't be synced
+		const excludePatterns = [
+			'.DS_Store',
+			'.git/',
+			'node_modules/',
+			'.obsidian/workspace.json',
+			'.obsidian/workspace-mobile.json',
+		];
+		
+		return !excludePatterns.some(pattern => 
+			pattern.endsWith('/') ? path.startsWith(pattern) : path.includes(pattern)
+		);
 	}
 
 	handleRename(file: TAbstractFile, oldPath: string) {
@@ -316,15 +341,11 @@ class SettingsTab extends PluginSettingTab {
 							text.setValue("");
 							return;
 						}
-						if (
-							vault
-								.getAllLoadedFiles()
-								.filter(({ path }) => path !== "/").length > 0
-						) {
-							new Notice(
-								"Your current vault is not empty! If you want our plugin to handle the initial sync, you have to clear out the current vault. Check the readme or website for more details.",
-								0
-							);
+						
+						// Ensure Obsidian folder structure exists
+						const structureCreated = await this.plugin.drive.ensureObsidianStructure();
+						if (!structureCreated) {
+							new Notice("Failed to create Obsidian folder structure in Google Drive.");
 							return cancel();
 						}
 
@@ -338,11 +359,61 @@ class SettingsTab extends PluginSettingTab {
 						this.plugin.settings.changesToken = changesToken;
 
 						await this.plugin.saveSettings();
+						
+						// Perform automatic sync if vault is empty (including hidden files)
+						const allFiles = await this.getAllVaultFiles();
+						const vaultFiles = allFiles.filter(path => 
+							path !== "/" && this.plugin.shouldSyncFile(path)
+						);
+						
+						if (vaultFiles.length === 0) {
+							new Notice("Performing initial sync from Google Drive...");
+							try {
+								await pull(this.plugin, true);
+								new Notice("Initial sync completed successfully!");
+							} catch (error) {
+								console.error("[GDriveSync] Initial sync failed:", error);
+								new Notice("Initial sync failed. You can manually sync later.");
+							}
+						} else {
+							new Notice(
+								"Your vault contains files. Please manually sync to merge with Google Drive content.",
+								8000
+							);
+						}
+						
 						new Notice(
-							"Refresh token saved! Reload Obsidian to activate sync.",
-							0
+							"Refresh token saved! Google Drive sync is now active.",
+							5000
 						);
 					});
 			});
+	}
+
+	async getAllVaultFiles(): Promise<string[]> {
+		const { adapter } = this.app.vault;
+		const files: string[] = [];
+		
+		const collectFiles = async (folderPath: string = ""): Promise<void> => {
+			try {
+				const list = await adapter.list(folderPath);
+				
+				// Add all files
+				for (const file of list.files) {
+					files.push(file);
+				}
+				
+				// Recursively collect from folders
+				for (const folder of list.folders) {
+					files.push(folder);
+					await collectFiles(folder);
+				}
+			} catch (error) {
+				console.warn(`[GDriveSync] Could not list folder: ${folderPath}`, error);
+			}
+		};
+		
+		await collectFiles();
+		return files;
 	}
 }

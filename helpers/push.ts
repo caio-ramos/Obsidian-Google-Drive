@@ -9,6 +9,33 @@ import {
 } from "./drive";
 import { pull } from "./pull";
 
+// Helper function to get all files in vault including hidden ones
+const getAllVaultFiles = async (adapter: any): Promise<string[]> => {
+	const files: string[] = [];
+	
+	const collectFiles = async (folderPath: string = ""): Promise<void> => {
+		try {
+			const list = await adapter.list(folderPath);
+			
+			// Add all files
+			for (const file of list.files) {
+				files.push(file);
+			}
+			
+			// Recursively collect from folders
+			for (const folder of list.folders) {
+				files.push(folder);
+				await collectFiles(folder);
+			}
+		} catch (error) {
+			console.warn(`[GDriveSync] Could not list folder: ${folderPath}`, error);
+		}
+	};
+	
+	await collectFiles();
+	return files;
+};
+
 class ConfirmPushModal extends Modal {
 	proceed: (res: boolean) => void;
 
@@ -26,6 +53,20 @@ class ConfirmPushModal extends Modal {
 			.setText(
 				"Do you want to push the following changes to Google Drive:"
 			);
+		
+		// Show count of hidden files if any
+		const hiddenFiles = initialOperations.filter(([path]) => {
+			const fileName = path.split('/').pop() || '';
+			return fileName.startsWith('.');
+		});
+		
+		if (hiddenFiles.length > 0) {
+			const hiddenInfo = this.contentEl.createEl("p");
+			hiddenInfo.style.color = "#888";
+			hiddenInfo.style.fontSize = "0.9em";
+			hiddenInfo.setText(`📁 Including ${hiddenFiles.length} hidden file(s) starting with "."`);
+		}
+		
 		const container = this.contentEl.createEl("div");
 
 		const render = (operations: typeof initialOperations) => {
@@ -36,6 +77,18 @@ class ConfirmPushModal extends Modal {
 
 				const p = div.createEl("p");
 				p.createEl("b").setText(`${op[0].toUpperCase()}${op.slice(1)}`);
+				
+				// Add icon for hidden files
+				const fileName = path.split('/').pop() || '';
+				const isHidden = fileName.startsWith('.');
+				
+				if (isHidden) {
+					const hiddenIcon = p.createSpan();
+					hiddenIcon.setText(" 👁️");
+					hiddenIcon.style.opacity = "0.7";
+					hiddenIcon.title = "Hidden file (starts with .)";
+				}
+				
 				p.createSpan().setText(`: ${path}`);
 
 				if (
@@ -242,12 +295,74 @@ class ConfirmUndoModal extends Modal {
 
 export const push = async (t: ObsidianGoogleDrive) => {
 	if (t.syncing) return;
-	const initialOperations = Object.entries(t.settings.operations).sort(
-		([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)
-	); // Alphabetical
-
+	
+	console.log("[GDriveSync] Starting push operation");
+	
+	// Ensure folder structure exists before pushing files
+	await t.drive.getRootFolderId();
+	
+	// Get all operations including hidden files
+	let allOperations = Object.entries(t.settings.operations);
+	console.log(`[GDriveSync] Found ${allOperations.length} operations from settings`);
+	
+	// Also check for hidden files that might not be in operations but should be synced
+	const hiddenFiles = await t.drive.searchHiddenFiles();
+	console.log(`[GDriveSync] Found ${hiddenFiles.length} hidden files in Drive`);
+	
+	// Check for local hidden files that might need to be pushed
 	const { vault } = t.app;
 	const adapter = vault.adapter;
+	
+	try {
+		const allLocalFiles = await getAllVaultFiles(adapter);
+		const hiddenLocalFiles = allLocalFiles.filter((path: string) => {
+			const fileName = path.split('/').pop() || '';
+			return fileName.startsWith('.') && t.shouldSyncFile && t.shouldSyncFile(path);
+		});
+		
+		console.log(`[GDriveSync] Found ${hiddenLocalFiles.length} local hidden files`);
+		
+		// Add hidden files to operations if they're not already tracked
+		hiddenLocalFiles.forEach((path: string) => {
+			if (!t.settings.operations[path]) {
+				const file = vault.getAbstractFileByPath(path);
+				if (file) {
+					// Check if file exists in Drive
+					const existsInDrive = hiddenFiles.some(driveFile => 
+						driveFile.properties?.path === path
+					);
+					
+					if (!existsInDrive) {
+						t.settings.operations[path] = "create";
+						console.log(`[GDriveSync] Added hidden file to create: ${path}`);
+					} else {
+						// Check if local file is newer than drive file
+						const driveFile = hiddenFiles.find(df => df.properties?.path === path);
+						if (driveFile && file instanceof TFile) {
+							const localMtime = file.stat.mtime;
+							const driveMtime = new Date(driveFile.modifiedTime).getTime();
+							
+							if (localMtime > driveMtime) {
+								t.settings.operations[path] = "modify";
+								console.log(`[GDriveSync] Added hidden file to modify: ${path}`);
+							}
+						}
+					}
+				}
+			}
+		});
+		
+		// Refresh operations list
+		allOperations = Object.entries(t.settings.operations);
+		console.log(`[GDriveSync] Total operations after hidden file check: ${allOperations.length}`);
+		
+	} catch (error) {
+		console.warn("[GDriveSync] Could not check for hidden files:", error);
+	}
+	
+	const initialOperations = allOperations.sort(
+		([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)
+	); // Alphabetical
 
 	const proceed = await new Promise<boolean>((resolve) => {
 		new ConfirmPushModal(t, initialOperations, resolve).open();
@@ -259,11 +374,11 @@ export const push = async (t: ObsidianGoogleDrive) => {
 
 	await pull(t, true);
 
-	const operations = Object.entries(t.settings.operations);
+	const finalOperations = Object.entries(t.settings.operations);
 
-	const deletes = operations.filter(([_, op]) => op === "delete");
-	const creates = operations.filter(([_, op]) => op === "create");
-	const modifies = operations.filter(([_, op]) => op === "modify");
+	const deletes = finalOperations.filter(([_, op]) => op === "delete");
+	const creates = finalOperations.filter(([_, op]) => op === "create");
+	const modifies = finalOperations.filter(([_, op]) => op === "modify");
 
 	const pathsToIds = Object.fromEntries(
 		Object.entries(t.settings.driveIdToPath).map(([id, path]) => [path, id])

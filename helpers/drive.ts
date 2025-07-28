@@ -167,37 +167,92 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 
 		if (includeObsidian) return files.files as FileMetadata[];
 
+		// Filter out only the vault root folder, but include all hidden files/folders (starting with .)
 		return files.files.filter(
-			({ properties }) => properties?.obsidian !== "vault"
+			({ properties, name }) => {
+				// Exclude the vault root folder
+				if (properties?.obsidian === "vault") return false;
+				
+				// Include all other files, including hidden ones that start with .
+				return true;
+			}
 		) as FileMetadata[];
 	};
 
 	const getRootFolderId = async () => {
-		const files = await searchFiles(
-			{
-				matches: [{ properties: { obsidian: "vault" } }],
-			},
-			true
-		);
-		if (!files) return;
-		if (!files.length) {
-			const rootFolder = await drive
+		console.log("[GDriveSync] Getting root folder ID");
+		
+		// Step 1: Ensure "Obsidian" container folder exists
+		let obsidianFolderId: string;
+		
+		// Search for existing Obsidian container folder
+		const obsidianFolders = await drive
+			.get(`drive/v3/files?q=${encodeURIComponent(
+				`name='Obsidian' and mimeType='${folderMimeType}' and trashed=false and 'root' in parents`
+			)}&fields=files(id,name)`)
+			.json<any>();
+		
+		if (!obsidianFolders?.files?.length) {
+			console.log("[GDriveSync] Creating Obsidian container folder");
+			// Create Obsidian container folder
+			const obsidianFolder = await drive
 				.post(`drive/v3/files`, {
 					json: {
-						name: t.app.vault.getName(),
+						name: "Obsidian",
 						mimeType: folderMimeType,
-						description: "Obsidian Vault: " + t.app.vault.getName(),
+						description: "Obsidian Vaults Container",
+						parents: ["root"],
+					},
+				})
+				.json<any>();
+			if (!obsidianFolder) {
+				console.error("[GDriveSync] Failed to create Obsidian container folder");
+				return;
+			}
+			obsidianFolderId = obsidianFolder.id;
+			console.log("[GDriveSync] Created Obsidian container folder with ID:", obsidianFolderId);
+		} else {
+			obsidianFolderId = obsidianFolders.files[0].id;
+			console.log("[GDriveSync] Found existing Obsidian container folder with ID:", obsidianFolderId);
+		}
+		
+		// Step 2: Ensure vault folder exists inside Obsidian container
+		const vaultName = t.app.vault.getName();
+		console.log("[GDriveSync] Looking for vault folder:", vaultName);
+		
+		// Search for vault folder inside Obsidian container
+		const vaultFolders = await drive
+			.get(`drive/v3/files?q=${encodeURIComponent(
+				`name='${escapeQueryString(vaultName)}' and mimeType='${folderMimeType}' and trashed=false and '${obsidianFolderId}' in parents`
+			)}&fields=files(id,name,properties)`)
+			.json<any>();
+		
+		if (!vaultFolders?.files?.length) {
+			console.log("[GDriveSync] Creating vault folder inside Obsidian container");
+			// Create vault folder inside Obsidian container
+			const vaultFolder = await drive
+				.post(`drive/v3/files`, {
+					json: {
+						name: vaultName,
+						mimeType: folderMimeType,
+						description: "Obsidian Vault: " + vaultName,
+						parents: [obsidianFolderId],
 						properties: {
 							obsidian: "vault",
-							vault: t.app.vault.getName(),
+							vault: vaultName,
 						},
 					},
 				})
 				.json<any>();
-			if (!rootFolder) return;
-			return rootFolder.id as string;
+			if (!vaultFolder) {
+				console.error("[GDriveSync] Failed to create vault folder");
+				return;
+			}
+			console.log("[GDriveSync] Created vault folder with ID:", vaultFolder.id);
+			return vaultFolder.id as string;
 		} else {
-			return files[0].id as string;
+			console.log("[GDriveSync] Found existing vault folder with ID:", vaultFolders.files[0].id);
+			return vaultFolders.files[0].id as string;
 		}
 	};
 
@@ -458,6 +513,59 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		await Promise.all(files.map((file) => t.deleteFile(file)));
 	};
 
+	const searchHiddenFiles = async (parentId?: string) => {
+		if (!parentId) {
+			parentId = await getRootFolderId();
+			if (!parentId) return [];
+		}
+		
+		console.log("[GDriveSync] Searching for hidden files/folders starting with '.'");
+		
+		try {
+			// Search for files and folders that start with . (hidden files)
+			// We search for files with vault property and name starting with .
+			const hiddenFiles = await drive
+				.get(`drive/v3/files?q=${encodeURIComponent(
+					`'${parentId}' in parents and trashed=false and properties has { key='vault' and value='${escapeQueryString(t.app.vault.getName())}' }`
+				)}&fields=files(id,name,mimeType,properties,modifiedTime)&pageSize=1000`)
+				.json<any>();
+			
+			if (!hiddenFiles?.files) {
+				console.log("[GDriveSync] No files found in parent folder");
+				return [];
+			}
+			
+			// Filter to only include files that actually start with .
+			const actualHiddenFiles = hiddenFiles.files.filter((file: any) => {
+				const startsWithDot = file.name.startsWith('.');
+				const hasPath = file.properties?.path;
+				
+				if (startsWithDot) {
+					console.log(`[GDriveSync] Found hidden file: ${file.name} (path: ${hasPath ? file.properties.path : 'no path'})`);
+				}
+				
+				return startsWithDot && hasPath;
+			});
+			
+			console.log(`[GDriveSync] Found ${actualHiddenFiles.length} valid hidden files/folders`);
+			return actualHiddenFiles as FileMetadata[];
+		} catch (error) {
+			console.error("[GDriveSync] Error searching for hidden files:", error);
+			return [];
+		}
+	};
+
+	const ensureObsidianStructure = async () => {
+		console.log("[GDriveSync] Ensuring Obsidian folder structure");
+		const rootFolderId = await getRootFolderId();
+		if (!rootFolderId) {
+			console.error("[GDriveSync] Failed to ensure Obsidian structure");
+			return false;
+		}
+		console.log("[GDriveSync] Obsidian structure confirmed with vault ID:", rootFolderId);
+		return true;
+	};
+
 	const getConfigFilesToSync = async () => {
 		const configFilesToSync: string[] = [];
 		const { vault } = t.app;
@@ -512,7 +620,9 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 	return {
 		paginateFiles,
 		searchFiles,
+		searchHiddenFiles,
 		getRootFolderId,
+		ensureObsidianStructure,
 		createFolder,
 		uploadFile,
 		updateFile,
