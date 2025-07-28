@@ -42,9 +42,14 @@ const WHITELISTED_PLUGIN_FILES = [
 ];
 
 const stringSearchToQuery = (search: StringSearch) => {
-	if (typeof search === "string") return `='${search}'`;
-	if ("contains" in search) return ` contains '${search.contains}'`;
-	if ("not" in search) return `!='${search.not}'`;
+	if (typeof search === "string") return `='${search.replace(/'/g, "\\'")}'`;
+	if ("contains" in search) return ` contains '${search.contains.replace(/'/g, "\\'")}'`;
+	if ("not" in search) return `!='${search.not.replace(/'/g, "\\'")}'`;
+};
+
+const escapeQueryString = (str: string) => {
+	// Escape single quotes and backslashes for Google Drive API queries
+	return str.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 };
 
 const queryHandlers = {
@@ -94,7 +99,7 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 				})
 				.join(
 					" or "
-				)}) and trashed=false and properties has { key='vault' and value='${t.app.vault.getName()}' }`
+				)}) and trashed=false and properties has { key='vault' and value='${escapeQueryString(t.app.vault.getName())}' }`
 		);
 
 	const paginateFiles = async ({
